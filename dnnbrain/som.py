@@ -28,7 +28,6 @@ def _build_iteration_indexes(data_len, num_iterations,
     else:
         return iterations
 
-
 def _wrap_index__in_verbose(iterations):
     m = len(iterations)
     digits = len(str(m))
@@ -46,13 +45,14 @@ def _wrap_index__in_verbose(iterations):
         progress += ' - {time_left} left '.format(time_left=time_left)
         sys.stdout.write(progress)
 
-
 def fast_norm(x):
     return np.sqrt(np.dot(x, x.T))
 
-
 def asymptotic_decay(scalar, t, max_iter):
     return scalar / (1+t/(max_iter/2))
+
+def none_decay(scalar, t, max_iter):
+    return scalar
 
 
 
@@ -60,7 +60,7 @@ def asymptotic_decay(scalar, t, max_iter):
 class VTCSOM(minisom.MiniSom):
     #### Initialization ####
     def __init__(self, x, y, input_len, sigma=1.0, learning_rate=0.5,
-                 decay_function=asymptotic_decay,
+                 sigma_decay_function=asymptotic_decay, lr_decay_function=asymptotic_decay,
                  neighborhood_function='gaussian', random_seed=None):
         """
         x : int
@@ -92,7 +92,8 @@ class VTCSOM(minisom.MiniSom):
         self._activation_map = np.zeros((x, y))
         self._neigx = np.arange(x)
         self._neigy = np.arange(y)  # used to evaluate the neighborhood function
-        self._decay_function = decay_function
+        self._lr_decay_function = lr_decay_function
+        self._sigma_decay_function = sigma_decay_function
 
         neig_functions = {'gaussian': self._gaussian,
                           'mexican_hat': self._mexican_hat,
@@ -111,29 +112,18 @@ class VTCSOM(minisom.MiniSom):
 
         self.neighborhood = neig_functions[neighborhood_function]
                 
-    def Normalize_X(self, data):
-        """Normalize the data, where data is like (1000samples, 64features)"""
-        N, D = data.shape    # N is number of sample
-        for i in range(N):
-            temp = np.sum(np.multiply(data[i], data[i]))
-            data[i] /= np.sqrt(temp)
-        return data
+    def Normalize_X(self, x):
+        temp = np.sum(np.multiply(x, x))
+        x /= np.sqrt(temp)
+        return x
     
     
     #### Training ####      
-    def Train(self, data, num_iteration, initialization_way, verbose):
+    def Train(self, data, num_iteration, step_len, verbose):
         """Trains the SOM.
-        data : np.array or list
-            Data matrix.
-        num_iteration : int
-            Maximum number of iterations (one iteration per sample).
-        """
-        if initialization_way == 'random':
-            self.random_weights_init(data)
-        if initialization_way == 'pca':
-            self.pca_weights_init(data)
-            
-        data = self.Normalize_X(data)
+        data : np.array Data matrix (sample numbers, feature numbers).
+        num_iteration : Maximum number of iterations.
+        """            
         random_generator = self._random_generator
         iterations = _build_iteration_indexes(len(data), num_iteration,
                                               verbose, random_generator)
@@ -144,13 +134,63 @@ class VTCSOM(minisom.MiniSom):
             self.update(data[iteration], 
                         self.winner(data[iteration]), 
                         t, num_iteration) 
-            if (t+1) % 100 == 0:
+            if (t+1) % step_len == 0:
                 q_error = np.append(q_error, self.quantization_error(data))
                 t_error = np.append(t_error, self.topographic_error(data))
         if verbose:
             print('\n quantization error:', self.quantization_error(data))
             print(' topographic error:', self.topographic_error(data)) 
         return q_error, t_error
+    
+    def _activate(self, x):
+        """Updates matrix activation_map, in this matrix
+           the element i,j is the response of the neuron i,j to x."""
+        x = self.Normalize_X(x)
+        s = np.subtract(x, self._weights)  # x - w
+        self._activation_map = np.linalg.norm(s, axis=-1)
+
+    def activate(self, x):
+        """Returns the activation map to x."""
+        self._activate(x)
+        return self._activation_map
+    
+    def winner(self, x, k=0):
+        """Computes the coordinates of the winning neuron for the sample x."""
+        self._activate(x)
+        return np.unravel_index(self._activation_map.reshape(-1).argsort()[k],
+                                self._activation_map.shape)
+        
+    def activation_response(self, data, k=0):
+        """
+            Returns a matrix where the element i,j is the number of times
+            that the neuron i,j have been winner.
+        """
+        self._check_input_len(data)
+        a = np.zeros((self._weights.shape[0], self._weights.shape[1]))
+        for x in data:
+            a[self.winner(x, k)] += 1
+        return a
+    
+    def update(self, x, win, t, max_iteration):
+        """Updates the weights of the neurons.
+        Parameters
+        ----------
+        x : np.array
+            Current pattern to learn.
+        win : tuple
+            Position of the winning neuron for x (array or tuple).
+        t : int
+            Iteration index
+        max_iteration : int
+            Maximum number of training itarations.
+        """
+        eta = self._lr_decay_function(self._learning_rate, t, max_iteration)
+        # sigma and learning rate decrease with the same rule
+        sig = self._sigma_decay_function(self._sigma, t, max_iteration)
+        # improves the performances
+        g = self.neighborhood(win, sig)*eta
+        # w_new = eta * neighborhood_function * (x-w)
+        self._weights += np.einsum('ij, ijk->ijk', g, x-self._weights)
     
     
     #### Visulization ####
@@ -162,6 +202,9 @@ class VTCSOM(minisom.MiniSom):
         plt.colorbar()
         
     def Component_Plane(self, feature_index):
+        """
+        Component_Plane表示了map里每个位置的神经元对什么特征最敏感(或者理解为与该特征取值最匹配)
+        """
         plt.figure(figsize=(7, 7))
         plt.title('Component Plane: feature_index is %d' % feature_index)
         plt.imshow(self._weights[:,:,feature_index], cmap='coolwarm')
@@ -188,8 +231,10 @@ if __name__ == '__main__':
 
     # Initialization and training
     som = VTCSOM(7, 7, 4, sigma=3, learning_rate=0.5, 
-                  neighborhood_function='triangle', random_seed=None)
-    q_error, t_error = som.Train(data, 10000, initialization_way='pca', verbose=False)
+                      sigma_decay_function=none_decay, lr_decay_function=asymptotic_decay,
+                      neighborhood_function='gaussian')
+    som.pca_weights_init(data)
+    q_error, t_error = som.Train(data, 100, verbose=False)
     
     plt.figure()
     plt.plot(q_error)
@@ -202,3 +247,4 @@ if __name__ == '__main__':
     plt.xlabel('iteration index')
     
     
+
